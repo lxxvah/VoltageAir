@@ -1,0 +1,42 @@
+﻿# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---------- PyInstaller ----------
+*.manifest
+
+# ---------- 运行时产物 ----------
+logs/
+*.log
+
+# ---------- 动态生成的图标 ----------
+serial_monitor_icon.png
+voltage_pressure_icon.ico
+voltage_pressure_icon.png
+
+# ---------- IDE ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------- 系统 ----------
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---------- 环境变量 ----------
+.env
+*.local
