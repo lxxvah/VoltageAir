@@ -25,7 +25,8 @@
 - **程序图标**：每次启动动态生成 PNG；打包时使用 `app.ico`
 
 ---
-<img width="1439" height="962" alt="image" src="https://github.com/user-attachments/assets/f573dfed-89c2-42b9-938f-d929fcd0d704" />
+<img width="1439" height="962" alt="image" src="https://github.com/user-attachments/assets/1c4543f2-3d88-4e45-b2ed-33950693e692" />
+
 
 
 ## 快速开始
