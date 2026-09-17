@@ -1,20 +1,18 @@
 # main.py
-"""启动入口
+r"""启动入口
 
 关键设计：
   · 开启 Qt 高 DPI 支持（必须在 QApplication 之前）
   · 每次启动用 icon_gen 生成 PNG 图标，路径通过环境变量传给 MainWindow
   · 延迟导入 MainWindow，确保 QApplication 先建好
+  · 未捕获异常同时写 stderr 和 %APPDATA%\VoltageAir\crash.log
 """
 import os
 import sys
 import traceback
+from datetime import datetime
 
 from PyQt5 import QtCore, QtWidgets
-
-
-def _excepthook(t, v, tb):
-    traceback.print_exception(t, v, tb)
 
 
 def _app_dir() -> str:
@@ -24,12 +22,8 @@ def _app_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def _icon_dir() -> str:
-    """图标写入目录。
-
-    打包后 exe 可能位于受保护目录（如 Program Files），
-    优先写用户可写的 AppData / XDG 目录；失败再退回 exe 目录。
-    """
+def _appdata_dir() -> str:
+    """用户可写目录：优先 AppData，回退到 exe 目录"""
     try:
         base = QtCore.QStandardPaths.writableLocation(
             QtCore.QStandardPaths.AppDataLocation)
@@ -41,12 +35,31 @@ def _icon_dir() -> str:
     return _app_dir()
 
 
+def _excepthook(t, v, tb):
+    # 1) 打到 stderr（控制台跑时能看到）
+    traceback.print_exception(t, v, tb)
+
+    # 2) 追加到 crash.log（打包成 --windowed 后也能留证据）
+    try:
+        path = os.path.join(_appdata_dir(), "crash.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 60 + "\n")
+            f.write("[%s]\n"
+                    % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            traceback.print_exception(t, v, tb, file=f)
+    except Exception:
+        pass
+
+
+def _icon_dir() -> str:
+    """图标写入目录（和 crash.log 同目录，都是 AppData）"""
+    return _appdata_dir()
+
+
 def main():
     sys.excepthook = _excepthook
 
-    # ★ 高 DPI 支持 —— 必须在 QApplication 创建之前设置
-    #   AA_EnableHighDpiScaling：系统 150% 缩放时按逻辑像素渲染
-    #   AA_UseHighDpiPixmaps：   QPixmap 加载时使用高分辨率版本
+    # 高 DPI 支持 —— 必须在 QApplication 创建之前设置
     try:
         QtWidgets.QApplication.setAttribute(
             QtCore.Qt.AA_EnableHighDpiScaling, True)
@@ -58,7 +71,7 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    # ★ 每次启动生成图标（PNG）；路径通过环境变量传给 MainWindow
+    # 每次启动生成图标（PNG）
     png_path = None
     try:
         from icon_gen import generate_icon
@@ -66,7 +79,6 @@ def main():
         generate_icon(png_path, size=64)
         os.environ["SERIAL_SCOPE_ICON"] = png_path
     except Exception as e:
-        # 图标生成失败不影响主程序
         print("[icon] 生成失败:", e)
         png_path = None
 

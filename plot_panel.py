@@ -6,9 +6,14 @@
   · 30ms 定时器驱动绘制（锁 33fps）
   · 全局点数 > 5 万时按可视范围降采样到 5000 点
   · QTimer 挂 parent，防止 create_plot_panel 返回后被 GC
-  · ★ set_ui_scale(scale)：以"未加缩放前"的原始布局参数为基准，
-      所有尺寸按 scale 等比缩放（幂等，无累积误差）
-      · X 轴 label 底部留白保底 0.14，避免缩放较小时压到刻度线
+  · set_ui_scale(scale)：以"未加缩放前"的原始布局参数为基准等比缩放
+  · 断档用虚线：气压正常段实线 + 断档虚线；电压全程实心点 + 断档虚线
+    阈值自动推断（采样周期中位数 × 5），用户无需配置
+  · 电压实心点大小随可视 x 跨度自适应
+  · 鼠标悬停提示框在左上角
+  · 标题行：气压 → 电压 → 已测试 HH:MM:SS → 等待 HH:MM:SS
+  · ★ 新增"去冷却"勾选框：把冷却时长从 X 轴删掉，各轮波形首尾相接
+    对外提供 reset_x_max / refit_after_rebuild 两个 API 供切换时平滑刷新
 """
 import io
 import math
@@ -61,8 +66,89 @@ def _peak_downsample(xs, ys, max_pts=5000):
 
 
 # ==========================================================
+def _estimate_gap_threshold(xs):
+    """根据数据推断"正常采样周期"，再乘 5 作为断档阈值。"""
+    if xs is None or len(xs) < 4:
+        return 2.0
+    d = np.diff(np.asarray(xs, dtype=float))
+    d = d[np.isfinite(d) & (d > 0)]
+    if d.size == 0:
+        return 2.0
+    med = float(np.median(d))
+    if med <= 0:
+        return 2.0
+    return max(med * 5.0, 1.0)
+
+
+def _volt_dot_size(span_x):
+    """电压实心点大小（s = 面积 pt²）随可视 x 跨度自适应。"""
+    s_min, s_max = 6, 36
+    x = math.log10(max(float(span_x), 1.0))
+    t = min(1.0, max(0.0, x / 3.0))
+    return int(round(s_max - (s_max - s_min) * t))
+
+
+# ==========================================================
+def _split_with_gaps(xs, ys, gap_threshold):
+    """按相邻 x 间隔把数据切成若干连续段。"""
+    n = len(xs)
+    if n == 0:
+        return (np.array([]), np.array([]),
+                np.array([]), np.array([]))
+
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+
+    if n == 1:
+        return xs, ys, np.array([]), np.array([])
+
+    d = np.diff(xs)
+    break_idx = np.where(d > gap_threshold)[0] + 1
+
+    if len(break_idx) == 0:
+        return xs, ys, np.array([]), np.array([])
+
+    starts = [0] + list(break_idx)
+    ends   = list(break_idx) + [n]
+
+    solid_x = []
+    solid_y = []
+    for s, e in zip(starts, ends):
+        solid_x.extend(xs[s:e])
+        solid_y.extend(ys[s:e])
+        solid_x.append(np.nan)
+        solid_y.append(np.nan)
+    solid_x = np.asarray(solid_x)
+    solid_y = np.asarray(solid_y)
+
+    gap_x = []
+    gap_y = []
+    for bi in break_idx:
+        gap_x.extend([xs[bi - 1], xs[bi], np.nan])
+        gap_y.extend([ys[bi - 1], ys[bi], np.nan])
+    gap_x = np.asarray(gap_x)
+    gap_y = np.asarray(gap_y)
+
+    return solid_x, solid_y, gap_x, gap_y
+
+
+# ==========================================================
+def _fmt_hms(seconds):
+    """把秒数格式化为 HH:MM:SS。"""
+    try:
+        secs = int(max(0, float(seconds)))
+    except Exception:
+        secs = 0
+    h = secs // 3600
+    m = (secs % 3600) // 60
+    s = secs % 60
+    return "%02d:%02d:%02d" % (h, m, s)
+
+
+# ==========================================================
 class _PanelSignals(QtCore.QObject):
-    pauseToggle = QtCore.pyqtSignal()
+    pauseToggle    = QtCore.pyqtSignal()
+    compressToggle = QtCore.pyqtSignal(bool)    # ★ 去冷却开关
 
 
 # ==========================================================
@@ -81,14 +167,21 @@ def create_plot_panel(parent=None):
     COLOR_PRESS = T.accent_orange
     COLOR_VOLT = T.accent_blue
 
-    # ---------------- 布局基准（scale=1.0 时的值） ----------------
-    BASE_CARD_MARGINS = (12, 12, 12, 12)   # vbox
-    BASE_CARD_SPACING = 8                  # vbox
-    BASE_HDR_SPACING  = 8                  # hdr
-    BASE_DOT_SIZE     = 8                  # 色点边长
-    BASE_DOT_RADIUS   = 4                  # 色点圆角
-    BASE_HDR_SPACER   = 20                 # 气压/电压之间的间隔
-    BASE_CMB_VIEW_W   = 120                # VIEW 下拉宽度
+    GAP_LS    = (0, (3, 6))
+    GAP_ALPHA = 0.45
+    GAP_W_P   = 1.2
+    GAP_W_V   = 1.0
+
+    # ---------------- 布局基准 ----------------
+    BASE_CARD_MARGINS = (12, 12, 12, 12)
+    BASE_CARD_SPACING = 8
+    BASE_HDR_SPACING  = 8
+    BASE_DOT_SIZE     = 8
+    BASE_DOT_RADIUS   = 4
+    BASE_HDR_SPACER     = 18
+    BASE_ELAPSED_SPACER = 18
+    BASE_WAIT_SPACER    = 15
+    BASE_CMB_VIEW_W     = 80
 
     # ---------------- 状态 ----------------
     state = {
@@ -107,6 +200,8 @@ def create_plot_panel(parent=None):
         "rect_patch": None,
         "xs_p": None, "ys_p": None,
         "xs_v": None, "ys_v": None,
+        "gap_p": 2.0,
+        "gap_v": 2.0,
         "need_redraw": False,
         "ui_scale": 1.0,
     }
@@ -157,7 +252,6 @@ def create_plot_panel(parent=None):
     val_p = _value("— mmHg")
     hdr.addWidget(val_p)
 
-    # 可缩放 spacer（基准 20）
     spacer_pv = QtWidgets.QWidget()
     spacer_pv.setFixedWidth(BASE_HDR_SPACER)
     hdr.addWidget(spacer_pv)
@@ -167,7 +261,32 @@ def create_plot_panel(parent=None):
     val_v = _value("— V")
     hdr.addWidget(val_v)
 
+    spacer_el = QtWidgets.QWidget()
+    spacer_el.setFixedWidth(BASE_ELAPSED_SPACER)
+    hdr.addWidget(spacer_el)
+
+    lbl_elapsed = QtWidgets.QLabel("已测试 00:00:00")
+    lbl_elapsed.setObjectName("cardTitle")
+    lbl_elapsed.hide()
+    hdr.addWidget(lbl_elapsed)
+
+    spacer_w = QtWidgets.QWidget()
+    spacer_w.setFixedWidth(BASE_WAIT_SPACER)
+    hdr.addWidget(spacer_w)
+
+    lbl_wait = QtWidgets.QLabel("等待 00:00:00")
+    lbl_wait.setObjectName("cardTitle")
+    lbl_wait.hide()
+    hdr.addWidget(lbl_wait)
+
     hdr.addStretch(1)
+
+    # ★ 去冷却勾选框（放在 VIEW 前）
+    chk_compress = QtWidgets.QCheckBox("去冷却")
+    chk_compress.setToolTip("勾选后，把冷却/等待时间从 X 轴上删掉，\n"
+                            "各轮波形首尾相接显示")
+    chk_compress.toggled.connect(signals.compressToggle.emit)
+    hdr.addWidget(chk_compress)
 
     hdr.addWidget(_field("VIEW"))
     cmb_view = QtWidgets.QComboBox()
@@ -175,7 +294,9 @@ def create_plot_panel(parent=None):
                        ("最近 500", "500"), ("最近 1000", "1000"),
                        ("最近 2000", "2000")]:
         cmb_view.addItem(text, data)
-    cmb_view.setFixedWidth(BASE_CMB_VIEW_W)
+    cmb_view.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+    cmb_view.setMinimumWidth(60)
+    cmb_view.setMaximumWidth(100)
     hdr.addWidget(cmb_view)
 
     btn_latest = QtWidgets.QPushButton("回到最新")
@@ -252,9 +373,14 @@ def create_plot_panel(parent=None):
     ax2.yaxis.set_major_locator(MultipleLocator(VOLT_STEP))
 
     line_p, = ax1.plot([], [], color=COLOR_PRESS, linewidth=1.8,
-                       solid_capstyle='round')
-    line_v, = ax2.plot([], [], color=COLOR_VOLT, linewidth=1.4,
-                       solid_capstyle='round')
+                       solid_capstyle='round', zorder=3)
+    line_p_gap, = ax1.plot([], [], color=COLOR_PRESS, linewidth=GAP_W_P,
+                           linestyle=GAP_LS, alpha=GAP_ALPHA, zorder=2)
+
+    scatter_v = ax2.scatter([], [], s=10, color=COLOR_VOLT,
+                            marker='o', linewidths=0, zorder=4)
+    line_v_gap, = ax2.plot([], [], color=COLOR_VOLT, linewidth=GAP_W_V,
+                           linestyle=GAP_LS, alpha=GAP_ALPHA, zorder=2)
 
     vline = ax1.axvline(0, color='#888888', lw=0.7, alpha=0.7,
                         visible=False, zorder=10)
@@ -264,15 +390,15 @@ def create_plot_panel(parent=None):
                           visible=False, zorder=10)
 
     cursor_text = ax1.text(
-        0.99, 0.98, "",
+        0.01, 0.98, "",
         transform=ax1.transAxes,
-        ha='right', va='top',
+        ha='left', va='top',
         fontsize=8, color=T.ink,
         bbox=dict(boxstyle='round,pad=0.35',
                   facecolor='white',
                   edgecolor='#cccccc',
                   alpha=0.92),
-        visible=False, zorder=11)
+        visible=False, zorder=13)
 
     round_markers = []
 
@@ -442,7 +568,9 @@ def create_plot_panel(parent=None):
             return
         state['need_redraw'] = False
         x0, x1 = ax1.get_xlim()
+        span_x = max(1e-6, x1 - x0)
 
+        # ---------- 气压 ----------
         if state['xs_p'] is not None and len(state['xs_p']):
             xs = state['xs_p']; ys = state['ys_p']
             if len(xs) > VIEW_MASK_THRESHOLD:
@@ -451,10 +579,18 @@ def create_plot_panel(parent=None):
                 if len(xs_v) > DOWNSAMPLE_TARGET:
                     xs_v, ys_v = _peak_downsample(xs_v, ys_v,
                                                   DOWNSAMPLE_TARGET)
-                line_p.set_data(xs_v, ys_v)
             else:
-                line_p.set_data(xs, ys)
+                xs_v, ys_v = xs, ys
 
+            gap_thr = _estimate_gap_threshold(xs)
+            sx, sy, gx, gy = _split_with_gaps(xs_v, ys_v, gap_thr)
+            line_p.set_data(sx, sy)
+            line_p_gap.set_data(gx, gy)
+        else:
+            line_p.set_data([], [])
+            line_p_gap.set_data([], [])
+
+        # ---------- 电压 ----------
         if state['xs_v'] is not None and len(state['xs_v']):
             xs = state['xs_v']; ys = state['ys_v']
             if len(xs) > VIEW_MASK_THRESHOLD:
@@ -463,9 +599,22 @@ def create_plot_panel(parent=None):
                 if len(xs_v) > DOWNSAMPLE_TARGET:
                     xs_v, ys_v = _peak_downsample(xs_v, ys_v,
                                                   DOWNSAMPLE_TARGET)
-                line_v.set_data(xs_v, ys_v)
             else:
-                line_v.set_data(xs, ys)
+                xs_v, ys_v = xs, ys
+
+            gap_thr = _estimate_gap_threshold(xs)
+            _, _, gx, gy = _split_with_gaps(xs_v, ys_v, gap_thr)
+            line_v_gap.set_data(gx, gy)
+
+            if len(xs_v):
+                scatter_v.set_offsets(np.column_stack([xs_v, ys_v]))
+                dot_s = _volt_dot_size(span_x)
+                scatter_v.set_sizes([dot_s])
+            else:
+                scatter_v.set_offsets(np.empty((0, 2)))
+        else:
+            line_v_gap.set_data([], [])
+            scatter_v.set_offsets(np.empty((0, 2)))
 
         _apply_view()
         canvas.draw_idle()
@@ -805,6 +954,7 @@ def create_plot_panel(parent=None):
             x_max = float(xs[-1])
             if x_max > state['x_max']:
                 state['x_max'] = x_max
+            state['gap_p'] = _estimate_gap_threshold(xs)
         state['need_redraw'] = True
 
     def set_voltage(xs, ys):
@@ -815,6 +965,8 @@ def create_plot_panel(parent=None):
         x_max = float(xs[-1])
         if x_max > state['x_max']:
             state['x_max'] = x_max
+        state['gap_v'] = _estimate_gap_threshold(xs)
+
         need = float(max(ys)) * 1.02
         if need > state['volt_ymax']:
             state['volt_ymax'] = math.ceil(need / 0.5) * 0.5
@@ -832,11 +984,58 @@ def create_plot_panel(parent=None):
         ax1.set_xlabel(text, color=T.body_mid, fontsize=fs, labelpad=2)
         canvas.draw_idle()
 
-    def set_ui_scale(scale):
-        """★ 按"未加缩放前"的原始布局参数为基准等比缩放。
+    def set_elapsed(seconds):
+        """已测试时长：None / 负数 → 隐藏；否则显示 '已测试 HH:MM:SS'"""
+        if seconds is None:
+            lbl_elapsed.hide()
+            return
+        try:
+            secs = float(seconds)
+        except Exception:
+            lbl_elapsed.hide()
+            return
+        if secs < 0:
+            lbl_elapsed.hide()
+            return
+        lbl_elapsed.setText("已测试 " + _fmt_hms(secs))
+        lbl_elapsed.show()
 
-        幂等：反复调用相同 scale 结果一致（无累积误差）。
+    def set_waiting(active, seconds=0.0):
+        """等待下一轮：active=True 显示 '等待 HH:MM:SS'，False 隐藏"""
+        if active:
+            try:
+                secs = float(seconds)
+            except Exception:
+                secs = 0.0
+            lbl_wait.setText("等待 " + _fmt_hms(secs))
+            lbl_wait.show()
+        else:
+            lbl_wait.hide()
+
+    def reset_x_max(v=100.0):
+        """★ 切换去冷却后重置内部 x_max（不触发视图刷新）"""
+        try:
+            state['x_max'] = max(0.0, float(v))
+        except Exception:
+            state['x_max'] = 100.0
+
+    def refit_after_rebuild():
+        """★ 数据重排后平滑刷新视图：
+             跟随中 → 跳到最新
+             锁定中 → 保持锁定但重置到 [0, x_max]，避免停留在旧范围
         """
+        try:
+            if state['follow'] and not state['locked']:
+                _apply_view(force=True)
+            else:
+                x_max = max(50.0, state['x_max'])
+                ax1.set_xlim(0, x_max)
+                _refresh_x_ticks(0, x_max)
+        except Exception:
+            pass
+        canvas.draw_idle()
+
+    def set_ui_scale(scale):
         try:
             scale = float(scale)
         except Exception:
@@ -848,7 +1047,6 @@ def create_plot_panel(parent=None):
         def S(v):
             return max(1, int(round(v * scale)))
 
-        # ---------- matplotlib 字体 ----------
         fs      = max(7, min(18, round(8 * scale)))
         fs_tick = max(6, fs - 1)
 
@@ -871,12 +1069,10 @@ def create_plot_panel(parent=None):
 
         left   = min(0.10, 0.045 * scale)
         right  = 1.0 - left
-        # ★ X 轴 label 保底留白 0.14，避免缩放较小时压到刻度线
         bottom = max(0.14, min(0.28, 0.14 * scale))
         top    = 0.975
         fig.subplots_adjust(left=left, right=right, top=top, bottom=bottom)
 
-        # ---------- Qt 布局尺寸（以基准值重算，不依赖当前值） ----------
         vbox.setContentsMargins(*[S(v) for v in BASE_CARD_MARGINS])
         vbox.setSpacing(S(BASE_CARD_SPACING))
         hdr.setSpacing(S(BASE_HDR_SPACING))
@@ -889,7 +1085,16 @@ def create_plot_panel(parent=None):
                             % (COLOR_VOLT, max(2, S(BASE_DOT_RADIUS))))
 
         spacer_pv.setFixedWidth(S(BASE_HDR_SPACER))
-        cmb_view.setFixedWidth(S(BASE_CMB_VIEW_W))
+        spacer_el.setFixedWidth(S(BASE_ELAPSED_SPACER))
+        spacer_w.setFixedWidth(S(BASE_WAIT_SPACER))
+
+        # ★ 勾选框字号同步
+        try:
+            f = chk_compress.font()
+            f.setPixelSize(max(8, int(round(12 * scale))))
+            chk_compress.setFont(f)
+        except Exception:
+            pass
 
         canvas.draw_idle()
 
@@ -907,11 +1112,25 @@ def create_plot_panel(parent=None):
                            linewidth=1, alpha=0.7)
         round_markers.append(line)
 
+    def clear_round_markers():
+        """只清空轮次分隔线（用于去冷却开关切换后重画）"""
+        for m in round_markers:
+            try:
+                m.remove()
+            except Exception:
+                pass
+        round_markers.clear()
+        canvas.draw_idle()
+
     def clear():
         line_p.set_data([], [])
-        line_v.set_data([], [])
+        line_p_gap.set_data([], [])
+        line_v_gap.set_data([], [])
+        scatter_v.set_offsets(np.empty((0, 2)))
+
         state['xs_p'] = None; state['ys_p'] = None
         state['xs_v'] = None; state['ys_v'] = None
+        state['gap_p'] = 2.0; state['gap_v'] = 2.0
         state['need_redraw'] = False
         for m in round_markers:
             try:
@@ -948,6 +1167,10 @@ def create_plot_panel(parent=None):
         _update_follow_label()
         val_p.setText("— mmHg")
         val_v.setText("— V")
+
+        lbl_elapsed.hide()
+        lbl_wait.hide()
+
         canvas.draw_idle()
 
     def toggle_lock():
@@ -961,20 +1184,25 @@ def create_plot_panel(parent=None):
     canvas.draw_idle()
 
     return {
-        "widget":            card,
-        "signals":           signals,
-        "set_pressure":      set_pressure,
-        "set_voltage":       set_voltage,
-        "set_x_range":       set_x_range,
-        "set_x_label":       set_x_label,
-        "set_ui_scale":      set_ui_scale,
-        "apply_view_force":  apply_view_force,
-        "set_values":        set_values,
-        "add_round_marker":  add_round_marker,
-        "clear":             clear,
-        "toggle_lock":       toggle_lock,
-        "save_png":          _save_png,
-        "copy_to_clipboard": _copy_to_clipboard,
-        "stop_timer":        stop_timer,
-        "_draw_timer":       draw_timer,
+        "widget":               card,
+        "signals":              signals,
+        "set_pressure":         set_pressure,
+        "set_voltage":          set_voltage,
+        "set_x_range":          set_x_range,
+        "set_x_label":          set_x_label,
+        "set_ui_scale":         set_ui_scale,
+        "set_elapsed":          set_elapsed,
+        "set_waiting":          set_waiting,
+        "reset_x_max":          reset_x_max,
+        "refit_after_rebuild":  refit_after_rebuild,
+        "apply_view_force":     apply_view_force,
+        "set_values":           set_values,
+        "add_round_marker":     add_round_marker,
+        "clear":                clear,
+        "toggle_lock":          toggle_lock,
+        "save_png":             _save_png,
+        "copy_to_clipboard":    _copy_to_clipboard,
+        "stop_timer":           stop_timer,
+        "_draw_timer":          draw_timer,
+        "clear_round_markers":  clear_round_markers,
     }

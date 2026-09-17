@@ -1,20 +1,23 @@
 # app.py
 """主窗口
 
-列序：轮次 / 电压 / 峰值 / 充气时间 / 泄气时间 / 状态
+列序：轮次 / 电压 / 峰值 / 充气时间 / 泄气时间 / 等待 / 状态
 充气时间 = stop inflate 时刻 − inflate START 时刻
 泄气时间 = slow deflate END 时刻 − slow deflate START 时刻
-表格 6 列等比例铺满整行；字号按列宽自适应缩小，保证表头/内容完整
+等待时间 = 下一轮 round_start 时刻 − 本轮 cool down 起点
 
-★ 时间基准：串口模式下，X 轴 0 点对齐到本轮第一次
-   round_start / inflate_start，而不是"点击连接"那一刻；
-   清空后同样等下一个测试起点重新对齐。
+★ 时间基准：串口模式下 X 轴 0 点对齐到本轮第一次 round_start / inflate_start
+★ 已测试 / 等待标签：串口模式下实时刷新，日志回放模式隐藏
+★ 去冷却：勾选后把冷却时长从 X 轴删掉，各轮波形首尾相接；
+           保留原始 x（raw）数组，显示 x 用「冷却前缀和 + 二分」映射，
+           复杂度 O(log N)；轮次分隔线也随开关重画。
 """
 import os
 import sys
 import time
 import csv
 import re
+import bisect
 import subprocess
 from datetime import datetime
 
@@ -122,7 +125,6 @@ class MainWindow(QtWidgets.QMainWindow):
     UI_SCALE_STEP = 0.05
     TOPBAR_EXTRA  = 0.85
 
-    # 启动窗口大小 = 屏幕可用区域 × INIT_WIN_FRAC
     INIT_WIN_FRAC = 0.92
     MIN_WIN_W = 1080
     MIN_WIN_H = 700
@@ -161,12 +163,10 @@ class MainWindow(QtWidgets.QMainWindow):
     B_BTN_SAVE_H         = 32
     B_STATS_SPACER       = 6
 
-    # 表格字号范围（px）
     TABLE_FONT_MIN = 8
     TABLE_FONT_MAX = 14
 
-    # 状态列现在是最后一列（0-based 索引 5）
-    STATUS_COL = 5
+    STATUS_COL = 6
 
     def __init__(self):
         super().__init__()
@@ -191,7 +191,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fixed_spacers = []
         self._fixed_vseps   = []
 
-        # 表格 QSS 缓存，避免重复 setStyleSheet
         self._last_table_qss = None
 
         try:
@@ -210,6 +209,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.arr_xp = GrowArray(); self.arr_p = GrowArray()
         self.arr_xv = GrowArray(); self.arr_v = GrowArray()
+        # ★ 保留原始 x（未压缩）
+        self.arr_raw_xp = GrowArray()
+        self.arr_raw_xv = GrowArray()
         self._sample_index = 0
 
         self.paused      = False
@@ -225,8 +227,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_ts0 = None
         self._last_ts = None
 
-        # ★ 串口模式下：是否已把 X 轴 0 点对齐到本轮测试起点
         self._test_aligned = False
+
+        self._waiting_active = False
+        self._wait_start_t   = None
+
+        # ★ 去冷却状态（前缀和 + 二分）
+        self._x_compress       = False
+        self._cooldowns        = []       # [(start_raw, end_raw), ...]
+        self._cooldown_starts  = []       # 冷却起点数组（递增，供 bisect）
+        self._cooldown_prefix  = [0.0]    # 前缀和：prefix[i+1]=prefix[i]+(e-s)
+        self._cooldown_start_x = None     # 正在冷却中的起点（raw）
+
+        # ★ 轮次分隔线 (raw_x, color)，切换时重画
+        self._round_markers    = []
 
         self._raw_buf = []
         self._raw_flush_timer = QtCore.QTimer(self)
@@ -237,6 +251,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
 
         self.plot["signals"].pauseToggle.connect(self._toggle_pause_key)
+        self.plot["signals"].compressToggle.connect(self._on_compress_toggle)
         self.stats.roundAdded.connect(self._on_round_added)
         self.stats.roundUpdated.connect(self._on_round_updated)
         self.stats.changed.connect(self._on_stats_changed)
@@ -248,7 +263,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.refresh_ports()
 
-        # 首次布局完成后，按列宽自适应一次表格字号
         QtCore.QTimer.singleShot(0, self._fit_stats_table)
 
     # ======================================================
@@ -440,15 +454,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         lay.addLayout(hdr)
 
-        # ★ 6 列，等比例铺满整行；表头不带单位，尽量短
-        self.table = QtWidgets.QTableWidget(0, 6)
+        self.table = QtWidgets.QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["轮次", "电压", "峰值", "充气时间", "泄气时间", "状态"])
+            ["轮次", "电压", "峰值", "充气时间", "泄气时间", "等待", "状态"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
 
-        # ★ 6 列等比例铺满
         _h = self.table.horizontalHeader()
         _h.setStretchLastSection(False)
         _h.setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
@@ -527,7 +539,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return l
 
     # ======================================================
-    # ★ 表格字号自适应：列宽均分 → 反推字号
+    # 表格字号自适应
     # ======================================================
     def _fit_stats_table(self):
         n = self.table.columnCount()
@@ -535,20 +547,17 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         vp_w = self.table.viewport().width()
         if vp_w <= 0:
-            # 表格尚未完成布局，稍后再试一次
             QtCore.QTimer.singleShot(0, self._fit_stats_table)
             return
 
         col_w = vp_w / float(n)
 
         def em_width(s: str) -> float:
-            """按 em 估算字符串宽度：中文 1.0，其他 0.55"""
             w = 0.0
             for ch in s:
                 w += 1.0 if ord(ch) > 0x7f else 0.55
             return w
 
-        # 表头最长行
         max_em = 0.0
         for c in range(n):
             item = self.table.horizontalHeaderItem(c)
@@ -557,7 +566,6 @@ class MainWindow(QtWidgets.QMainWindow):
             for line in item.text().split("\n"):
                 max_em = max(max_em, em_width(line))
 
-        # 单元格内容（最多统计前 200 行，避免长日志耗时）
         for r in range(min(self.table.rowCount(), 200)):
             for c in range(n):
                 it = self.table.item(r, c)
@@ -565,7 +573,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
                 max_em = max(max_em, em_width(it.text()))
 
-        # 两侧 padding + 边框留白
         pad = 22
         fs = int((col_w - pad) / max(1.0, max_em))
         fs = max(self.TABLE_FONT_MIN, min(self.TABLE_FONT_MAX, fs))
@@ -622,7 +629,6 @@ class MainWindow(QtWidgets.QMainWindow):
         def ST(v):
             return max(1, int(round(v * ts)))
 
-        # ---------- 顶栏 ----------
         self._topbar_layout.setContentsMargins(
             *[ST(v) for v in self.B_TOPBAR_MARGINS])
         self._topbar_layout.setSpacing(ST(self.B_TOPBAR_SPACING))
@@ -669,7 +675,6 @@ class MainWindow(QtWidgets.QMainWindow):
             }}
         """)
 
-        # ---------- body ----------
         self._body_layout.setContentsMargins(
             *[S(v) for v in self.B_BODY_MARGINS])
         self._body_layout.setSpacing(S(self.B_BODY_SPACING))
@@ -686,10 +691,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stats_hdr_layout.setSpacing(S(self.B_STATS_HDR_SPACING))
         self.btn_save_stats.setFixedHeight(S(self.B_BTN_SAVE_H))
 
-        # ★ 缩放后重算表格字号
         self._fit_stats_table()
 
-        # ---------- spacer / vsep ----------
         for w, base, top in self._fixed_spacers:
             w.setFixedWidth(ST(base) if top else S(base))
         for f, base, top in self._fixed_vseps:
@@ -708,7 +711,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if abs(new_scale - self._ui_scale) >= self.UI_SCALE_STEP:
             self._apply_ui_scale(new_scale)
         else:
-            # 缩放比没变，但窗口尺寸变了，仍需重算表格字号
             self._fit_stats_table()
 
     # ======================================================
@@ -720,6 +722,92 @@ class MainWindow(QtWidgets.QMainWindow):
     def clear_raw_log(self):
         self._raw_buf.clear()
         self.txt_raw.clear()
+
+    # ======================================================
+    # ★ 去冷却：raw_x → display_x 映射（O(log N)）
+    # ======================================================
+    def _map_x(self, raw_x):
+        """把原始 x 映射为显示 x（去掉冷却时长）。
+
+        使用「冷却起点数组 + 前缀和 + 二分」：
+          offset = 该点之前所有完整冷却区间的总时长
+                 + 若落在某个区间内，还要加上该区间已过去的时长
+        """
+        if not self._x_compress:
+            return raw_x
+
+        offset = 0.0
+        starts = self._cooldown_starts
+        if starts:
+            i = bisect.bisect_right(starts, raw_x) - 1
+            if i >= 0:
+                s_i, e_i = self._cooldowns[i]
+                if raw_x >= e_i:
+                    offset = self._cooldown_prefix[i + 1]
+                else:
+                    offset = self._cooldown_prefix[i] + (raw_x - s_i)
+
+        # 正在冷却中（区间尚未收尾）
+        if (self._cooldown_start_x is not None
+                and raw_x > self._cooldown_start_x):
+            offset += raw_x - self._cooldown_start_x
+
+        return max(0.0, raw_x - offset)
+
+    def _rebuild_display_x(self):
+        """开关切换后重算全部显示 x，并重画轮次分隔线"""
+        n = len(self.arr_raw_xp)
+        if n:
+            data = self.arr_xp._data
+            raw  = self.arr_raw_xp._data
+            for i in range(n):
+                data[i] = self._map_x(raw[i])
+
+        n = len(self.arr_raw_xv)
+        if n:
+            data = self.arr_xv._data
+            raw  = self.arr_raw_xv._data
+            for i in range(n):
+                data[i] = self._map_x(raw[i])
+
+        # ★ 重画轮次分隔线（保持 raw_x，按当前开关映射）
+        try:
+            self.plot["clear_round_markers"]()
+        except Exception:
+            pass
+        for rx, c in self._round_markers:
+            try:
+                self.plot["add_round_marker"](self._map_x(rx), color=c)
+            except Exception:
+                pass
+
+    def _on_compress_toggle(self, checked):
+        """勾选框切换：重算显示 x，重画 marker，平滑刷新视图"""
+        self._x_compress = bool(checked)
+        self._rebuild_display_x()
+
+        # 把 x_max 归零，让 set_pressure / set_voltage 重新推导
+        try:
+            self.plot["reset_x_max"](0.0)
+        except Exception:
+            pass
+
+        # 重新喂数据（会顺带把 x_max 更新到实际值）
+        if len(self.arr_xp):
+            self.plot["set_pressure"](self.arr_xp.array(),
+                                      self.arr_p.array())
+        if len(self.arr_xv):
+            self.plot["set_voltage"](self.arr_xv.array(),
+                                     self.arr_v.array())
+
+        # 平滑刷新视图
+        try:
+            self.plot["refit_after_rebuild"]()
+        except Exception:
+            pass
+
+        mode_txt = "去冷却：开" if self._x_compress else "去冷却：关"
+        self.statusBar().showMessage(mode_txt)
 
     # ======================================================
     # 串口
@@ -756,8 +844,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.clear_data()
 
-        # ★ 不在这里锁 _serial_t0：等第一轮 round_start / inflate_start 到达时
-        #   再对齐，让 X 轴 0 点 = 本轮测试起点，而不是"点击连接"时刻。
         self._x_unit = "time"
         try:
             self.plot["set_x_label"]("时间 (s)")
@@ -804,6 +890,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_conn.setText("○ 未连接")
         self._serial_t0 = None
         self._test_aligned = False
+        self._waiting_active = False
+        self._wait_start_t = None
+        try:
+            self.plot["set_elapsed"](None)
+            self.plot["set_waiting"](False, 0.0)
+        except Exception:
+            pass
 
     @staticmethod
     def _disconnect_worker_signals(w):
@@ -839,6 +932,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_conn.setText("○ 串口已关闭")
             self._serial_t0 = None
             self._test_aligned = False
+            self._waiting_active = False
+            self._wait_start_t = None
+            try:
+                self.plot["set_elapsed"](None)
+                self.plot["set_waiting"](False, 0.0)
+            except Exception:
+                pass
 
     # ======================================================
     # 加载日志
@@ -898,11 +998,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_load.setEnabled(True)
         self.btn_connect.setEnabled(True)
 
+        # 日志加载完成后如果"去冷却"开着，需要重排一遍显示 x
+        if self._x_compress:
+            self._rebuild_display_x()
+            try:
+                self.plot["reset_x_max"](0.0)
+            except Exception:
+                pass
+
         self._force_refresh_plot()
         self._rebuild_stats_table()
 
-        # ★ 加载完成后重算字号，确保长内容也不截断
         self._fit_stats_table()
+
+        self._waiting_active = False
+        self._wait_start_t = None
+        try:
+            self.plot["set_elapsed"](None)
+            self.plot["set_waiting"](False, 0.0)
+        except Exception:
+            pass
+
+        if self._x_compress:
+            try:
+                self.plot["refit_after_rebuild"]()
+            except Exception:
+                pass
 
         s = self.stats.summary()
         self.statusBar().showMessage(
@@ -938,21 +1059,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.bad_count += 1
             return
 
-        # 时间戳继承
         if p.ts is not None:
             self._last_ts = p.ts
         ts_eff = p.ts if p.ts is not None else self._last_ts
 
-        # ★ 串口模式：第一轮测试起点到达时，才把 X 轴 0 点对齐到这里。
-        #   支持 round_start（===== Auto BP Test START =====）和
-        #   inflate_start（[Test] inflate START, target=220 mmHg）。
+        # 串口模式：第一轮测试起点对齐 X 轴 0 点
         if (self.worker is not None
                 and not self._test_aligned
                 and p.event in ('round_start', 'inflate_start')):
             self._serial_t0 = time.monotonic()
             self._test_aligned = True
 
-        # 首次决定 X 单位
+        # 串口模式：等待计时
+        if self.worker is not None:
+            if p.event == 'cooldown':
+                self._wait_start_t = time.monotonic()
+                self._waiting_active = True
+            elif p.event == 'round_start' and self._waiting_active:
+                self._waiting_active = False
+                self._wait_start_t = None
+                try:
+                    self.plot["set_waiting"](False, 0.0)
+                except Exception:
+                    pass
+
         if self._x_unit is None:
             if self.worker is not None:
                 self._x_unit = "time"
@@ -971,36 +1101,57 @@ class MainWindow(QtWidgets.QMainWindow):
         if p.pressure is not None or p.voltage is not None:
             self._sample_index += 1
 
-        # 计算 X
+        # ---------- 计算原始 X（未压缩） ----------
         if self._x_unit == "time":
             if self.worker is not None and self._serial_t0 is not None:
-                x = time.monotonic() - self._serial_t0
+                raw_x = time.monotonic() - self._serial_t0
             elif self.worker is not None:
-                # 串口已连接，但还没等到第一轮测试起点：
-                # 给这些早期事件一个 x=0，避免它们在图上乱画
-                x = 0.0
+                raw_x = 0.0
             elif ts_eff is not None:
                 if self._log_ts0 is None:
                     self._log_ts0 = ts_eff
-                x = max(0.0, ts_eff - self._log_ts0)
+                raw_x = max(0.0, ts_eff - self._log_ts0)
             else:
-                x = float(self._sample_index)
+                raw_x = float(self._sample_index)
         else:
-            x = float(self._sample_index)
+            raw_x = float(self._sample_index)
+
+        # ★ 冷却区间记录（前缀和版）：cooldown → 起点；round_start → 收尾
+        if self._x_unit == "time":
+            if p.event == 'cooldown':
+                self._cooldown_start_x = raw_x
+            elif (p.event == 'round_start'
+                    and self._cooldown_start_x is not None):
+                if raw_x > self._cooldown_start_x:
+                    s = self._cooldown_start_x
+                    e = raw_x
+                    self._cooldowns.append((s, e))
+                    self._cooldown_starts.append(s)
+                    self._cooldown_prefix.append(
+                        self._cooldown_prefix[-1] + (e - s))
+                self._cooldown_start_x = None
+
+        # ★ 显示 X（按当前开关映射）
+        x = self._map_x(raw_x)
 
         if p.pressure is not None:
+            self.arr_raw_xp.append(raw_x)
             self.arr_xp.append(x)
             self.arr_p.append(p.pressure)
             self._last_p = p.pressure
         if p.voltage is not None:
+            self.arr_raw_xv.append(raw_x)
             self.arr_xv.append(x)
             self.arr_v.append(p.voltage)
             self._last_v = p.voltage
 
+        # ★ 记录轮次分隔线（保存 raw_x，切换时重画）
         if p.event == 'round_start':
             self.plot["add_round_marker"](x, color=T.accent_green)
+            self._round_markers.append((raw_x, T.accent_green))
         elif p.event == 'round_done':
             self.plot["add_round_marker"](x, color=T.accent_red)
+            self._round_markers.append((raw_x, T.accent_red))
 
         self.stats.feed(p, x)
 
@@ -1009,15 +1160,21 @@ class MainWindow(QtWidgets.QMainWindow):
         n = len(self.arr_p)
         if n > self.MAX_POINTS:
             d = n // 2
+            self.arr_raw_xp._data[:n-d] = self.arr_raw_xp._data[d:n]
             self.arr_xp._data[:n-d] = self.arr_xp._data[d:n]
             self.arr_p._data[:n-d] = self.arr_p._data[d:n]
-            self.arr_xp._n = n - d; self.arr_p._n = n - d
+            self.arr_raw_xp._n = n - d
+            self.arr_xp._n = n - d
+            self.arr_p._n = n - d
         n = len(self.arr_v)
         if n > self.MAX_POINTS:
             d = n // 2
+            self.arr_raw_xv._data[:n-d] = self.arr_raw_xv._data[d:n]
             self.arr_xv._data[:n-d] = self.arr_xv._data[d:n]
             self.arr_v._data[:n-d] = self.arr_v._data[d:n]
-            self.arr_xv._n = n - d; self.arr_v._n = n - d
+            self.arr_raw_xv._n = n - d
+            self.arr_xv._n = n - d
+            self.arr_v._n = n - d
 
         if not self.loading:
             rt = ""
@@ -1077,7 +1234,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setText(str(v))
                 item.setTextAlignment(QtCore.Qt.AlignCenter)
         self.table.scrollToBottom()
-        # 内容变化后重算字号（一般表头才是最长项，几乎不会变）
         self._fit_stats_table()
 
     def _on_round_updated(self, idx):
@@ -1126,7 +1282,7 @@ class MainWindow(QtWidgets.QMainWindow):
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
                 writer.writerow(["轮次", "电压", "峰值",
-                                 "充气时间", "泄气时间", "状态"])
+                                 "充气时间", "泄气时间", "等待", "状态"])
                 for rec in self.stats.rounds:
                     writer.writerow(rec.as_row())
             self.statusBar().showMessage(
@@ -1158,6 +1314,23 @@ class MainWindow(QtWidgets.QMainWindow):
             v_text = "— V" if self._last_v is None else "%.4f V" % self._last_v
             self.plot["set_values"](p_text, v_text)
 
+        # 已测试时长：串口模式下从 _serial_t0 起算，按当前开关映射
+        if self.worker is not None and self._serial_t0 is not None:
+            raw_elapsed = time.monotonic() - self._serial_t0
+            elapsed = self._map_x(raw_elapsed)
+            try:
+                self.plot["set_elapsed"](elapsed)
+            except Exception:
+                pass
+
+        # 等待下一轮：cool down 到达后开始计时
+        if self._waiting_active and self._wait_start_t is not None:
+            dt = time.monotonic() - self._wait_start_t
+            try:
+                self.plot["set_waiting"](True, dt)
+            except Exception:
+                pass
+
     # ======================================================
     # 其它
     # ======================================================
@@ -1183,6 +1356,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def clear_data(self):
         self.arr_xp.clear(); self.arr_p.clear()
         self.arr_xv.clear(); self.arr_v.clear()
+        self.arr_raw_xp.clear()
+        self.arr_raw_xv.clear()
         self._sample_index = 0
         self.frame_count   = 0
         self.bad_count     = 0
@@ -1199,10 +1374,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.setRowCount(0)
         self._update_round_label()
 
-        # ★ 清空后：串口模式下等下一个测试起点事件再对齐 X 轴 0 点；
-        #   日志模式下 _log_ts0 已置 None，下一行带 ts 的日志会成为新基准。
         self._serial_t0 = None
         self._test_aligned = False
+
+        self._waiting_active = False
+        self._wait_start_t = None
+
+        # 去冷却：清空冷却区间和 raw 数组；保留用户当前开关状态
+        self._cooldowns = []
+        self._cooldown_starts = []
+        self._cooldown_prefix = [0.0]
+        self._cooldown_start_x = None
+
+        # 轮次分隔线记录也清空
+        self._round_markers = []
+
+        try:
+            self.plot["set_elapsed"](None)
+            self.plot["set_waiting"](False, 0.0)
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         self.timer.stop()

@@ -58,7 +58,7 @@ class DataParser:
 
     # ===== Auto BP Test START =====
     ROUND_START_RE = re.compile(
-        r'=====\s*Auto\s+BP\s+Test\s+START', re.IGNORECASE)
+        r'={3,}\s*Auto\s+BP\s+Test\s+START', re.IGNORECASE)
 
     # ★ [Test] inflate START, target=220 mmHg
     INFLATE_START_RE = re.compile(

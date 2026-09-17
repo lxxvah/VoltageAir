@@ -1,7 +1,7 @@
 # stats.py
-"""统计模块 —— 统计循环次数、电压值、气压峰值、充气时间、泄气时间、状态
+"""统计模块 —— 统计循环次数、电压值、气压峰值、充气时间、泄气时间、等待时间、状态
 
-as_row 顺序：轮次 / 电压 / 峰值 / 充气时间 / 泄气时间 / 状态
+as_row 顺序：轮次 / 电压 / 峰值 / 充气时间 / 泄气时间 / 等待 / 状态
 """
 from dataclasses import dataclass
 from typing import List, Optional
@@ -21,12 +21,15 @@ class RoundRecord:
 
     x_start:       Optional[float] = None
     x_end:         Optional[float] = None
+    x_next_start:  Optional[float] = None   # ★ 下一轮 round_start 时刻
 
     x_inflate_start: Optional[float] = None
     x_inflate_stop:  Optional[float] = None
 
     x_deflate_start: Optional[float] = None
     x_deflate_stop:  Optional[float] = None
+
+    x_cooldown_start: Optional[float] = None  # ★ cool down 行到达时刻
 
     @property
     def ok(self) -> bool:
@@ -52,14 +55,21 @@ class RoundRecord:
             return None
         return self.x_deflate_stop - self.x_deflate_start
 
+    @property
+    def wait_time(self) -> Optional[float]:
+        """等待时间 = 下一轮 round_start 时刻 − 本轮 cool down 起点"""
+        if self.x_cooldown_start is None or self.x_next_start is None:
+            return None
+        return self.x_next_start - self.x_cooldown_start
+
     def as_row(self) -> list:
-        # ★ 状态挪到最后一列
         return [
             "R#%d" % self.no,
             "—" if self.voltage is None else "%.4f" % self.voltage,
             "—" if self.peak_pressure is None else "%.0f" % self.peak_pressure,
             "—" if self.inflate_time is None else "%.2f" % self.inflate_time,
             "—" if self.deflate_time is None else "%.2f" % self.deflate_time,
+            "—" if self.wait_time is None else "%.2f" % self.wait_time,
             "—" if self.status is None
                 else ("OK" if self.ok else "FAIL(%d)" % self.status),
         ]
@@ -106,13 +116,20 @@ class StatsCollector(QtCore.QObject):
         if p.event == 'deflate_end':
             self._update_deflate_stop(x)
 
+        if p.event == 'cooldown':
+            self._update_cooldown_start(x)
+
         if p.event == 'round_done' and p.round:
             self._finish_round(x, p.round)
 
     # ------------------------------------------------------
     def _start_round(self, x):
-        if self._current is not None and self._current.x_end is None:
-            self._current.x_end = x
+        # 上一轮收尾：记录"下一轮起点"（用于计算等待时间）
+        if self._current is not None:
+            if self._current.x_next_start is None:
+                self._current.x_next_start = x
+            if self._current.x_end is None:
+                self._current.x_end = x
             self.roundUpdated.emit(len(self.rounds) - 1)
 
         next_no = max((r.no for r in self.rounds), default=0) + 1
@@ -123,7 +140,6 @@ class StatsCollector(QtCore.QObject):
         self.changed.emit()
 
     def _update_inflate_start(self, x):
-        """★ 只认第一次，防止重复 START 行覆盖起点"""
         if self._current is None:
             return
         if self._current.x_inflate_start is not None:
@@ -140,7 +156,6 @@ class StatsCollector(QtCore.QObject):
         self.changed.emit()
 
     def _update_deflate_start(self, x):
-        """★ 只认第一次，防止重复 START 行覆盖起点"""
         if self._current is None:
             return
         if self._current.x_deflate_start is not None:
@@ -153,6 +168,16 @@ class StatsCollector(QtCore.QObject):
         if self._current is None:
             return
         self._current.x_deflate_stop = x
+        self.roundUpdated.emit(len(self.rounds) - 1)
+        self.changed.emit()
+
+    def _update_cooldown_start(self, x):
+        """cool down 行到达 → 记录本轮进入冷却的时刻"""
+        if self._current is None:
+            return
+        if self._current.x_cooldown_start is not None:
+            return
+        self._current.x_cooldown_start = x
         self.roundUpdated.emit(len(self.rounds) - 1)
         self.changed.emit()
 
