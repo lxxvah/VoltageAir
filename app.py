@@ -1153,7 +1153,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plot["add_round_marker"](x, color=T.accent_red)
             self._round_markers.append((raw_x, T.accent_red))
 
-        self.stats.feed(p, x)
+        self.stats.feed(p, raw_x)
 
         self.frame_count += 1
 
