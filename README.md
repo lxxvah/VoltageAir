@@ -25,7 +25,8 @@
 - **程序图标**：每次启动动态生成 PNG；打包时使用 `app.ico`
 
 ---
-<img width="1439" height="962" alt="image" src="https://github.com/user-attachments/assets/1c4543f2-3d88-4e45-b2ed-33950693e692" />
+<img width="2238" height="1330" alt="img_v3_0215k_006098e1-8b13-411c-b859-1623405083ag" src="https://github.com/user-attachments/assets/2bdf876d-193b-4388-9d1e-0b5e0d2254f9" />
+
 
 
 
